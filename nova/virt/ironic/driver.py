@@ -45,6 +45,7 @@ from nova.console import type as console_type
 from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
+from nova.network.neutron import get_client
 from nova import objects
 from nova.objects import external_event as external_event_obj
 from nova.objects import fields as obj_fields
@@ -1042,7 +1043,99 @@ class IronicDriver(virt_driver.ComputeDriver):
 
         return hardware.InstanceInfo(state=map_power_state(node.power_state))
 
-    def _get_network_metadata(self, node, network_info):
+    def _trunk_link(self, vlan_id, link_id, mac_address):
+        trunk_link = {
+            "id": f"vlan{vlan_id}",
+            "type": "vlan",
+            "vlan_link": link_id,
+            "vlan_id": int(vlan_id),
+            "vlan_mac_address": mac_address
+        }
+        return trunk_link
+
+    def _trunk_network(self, vlan_id, fixed_ip, netmask):
+        trunk_network = {
+            "id": f"vlan{vlan_id}",
+            "link": f"vlan{vlan_id}",
+            "type": "ipv4",
+            "ip_address": fixed_ip,
+            "netmask": netmask
+        }
+        return trunk_network
+
+    def _fixed_ip_and_subnet_id_from_port(self, port):
+        try:
+            fixed_ip = port["fixed_ips"][0]["ip_address"]
+        except (KeyError, IndexError):
+            fixed_ip = ""
+        try:
+            subnet_id = port["fixed_ips"][0]["subnet_id"]
+        except (KeyError, IndexError):
+            subnet_id = ""
+        return (fixed_ip, subnet_id)
+
+    def _compose_trunk_network(self, neutron_client, subnet_id, fixed_ip,
+                               vlan_id):
+        if fixed_ip and subnet_id:
+            subnet = neutron_client.show_subnet(subnet_id).get("subnet")
+            subnet_ip_version = subnet.get("ip_version")
+            if subnet_ip_version != 4:
+                LOG.warning(
+                    "Only IPv4 networks are currently supported for trunks, "
+                    "subnet %(subnet_id)s IP version is %(ip_version)s. "
+                    "Only link for this network will be composed.",
+                    {"subnet_id": subnet_id, "ip_version": subnet_ip_version}
+                )
+                return
+            _ , mask = netutils.get_net_and_mask(subnet["cidr"])
+            trunk_net = self._trunk_network(vlan_id, fixed_ip, mask)
+            return trunk_net
+
+    def _compose_trunk_links_and_nets(self, neutron_client, trunk_ports, link):
+        trunk_links = []
+        trunk_nets = []
+        for port in trunk_ports.get("sub_ports", []):
+            vlan_id = port["segmentation_id"]
+            if port["segmentation_type"] != "vlan":
+                continue
+
+            subport = neutron_client.show_port(port["port_id"]).get("port")
+            fixed_ip, subnet_id = self._fixed_ip_and_subnet_id_from_port(
+                subport
+            )
+            trunk_net = self._compose_trunk_network(
+                neutron_client, subnet_id, fixed_ip, vlan_id
+            )
+            if trunk_net:
+                trunk_nets.append(trunk_net)
+            trunk_link = self._trunk_link(
+                vlan_id, link["id"], link["ethernet_mac_address"]
+            )
+            trunk_links.append(trunk_link)
+        return (trunk_links, trunk_nets)
+
+    def _add_trunk_ports_metadata(self, context, base_metadata):
+        neutron_client = get_client(context, admin=True)
+        links_with_vif = [
+            link for link in base_metadata["links"] if link.get("vif_id")
+        ]
+        for link in links_with_vif:
+            port_data = neutron_client.show_port(link["vif_id"]).get("port")
+            trunk_ports = port_data.get("trunk_details", {})
+            if trunk_ports:
+                trunk_links, trunk_nets = self._compose_trunk_links_and_nets(
+                    neutron_client, trunk_ports, link
+                )
+                base_metadata["links"].extend(trunk_links)
+                base_metadata["networks"].extend(trunk_nets)
+                LOG.info(
+                    "Base Metadata extended with trunk links: %(trunk_links)s "
+                    "and trunk networks: %(trunk_nets)s",
+                    {"trunk_links": trunk_links, "trunk_nets": trunk_nets}
+                )
+        return base_metadata
+
+    def _get_network_metadata(self, node, network_info, context):
         """Gets a more complete representation of the instance network info.
 
         This data is exposed as network_data.json in the metadata service and
@@ -1103,6 +1196,8 @@ class IronicDriver(virt_driver.ComputeDriver):
                              'type': 'phy'})
 
         base_metadata['links'].extend(additional_links)
+        self._add_trunk_ports_metadata(context, base_metadata)
+
         return base_metadata
 
     def _generate_configdrive(self, context, instance, node, network_info,
@@ -1121,9 +1216,10 @@ class IronicDriver(virt_driver.ComputeDriver):
         if not extra_md:
             extra_md = {}
 
+        network_md = self._get_network_metadata(node, network_info, context)
         i_meta = instance_metadata.InstanceMetadata(instance,
             content=files, extra_md=extra_md, network_info=network_info,
-            network_metadata=self._get_network_metadata(node, network_info))
+            network_metadata=network_md)
 
         with tempfile.NamedTemporaryFile() as uncompressed:
             with configdrive.ConfigDriveBuilder(instance_md=i_meta) as cdb:
